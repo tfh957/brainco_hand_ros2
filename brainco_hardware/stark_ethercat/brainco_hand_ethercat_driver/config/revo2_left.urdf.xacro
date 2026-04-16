@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="revo2_left">
     <xacro:arg name="initial_positions_file" default="revo2_left_initial_positions.yaml" />
-    <xacro:arg name="ctrl_param_duration_ms" default="10" />
+    <xacro:arg name="ctrl_param_duration_ms" default="55" />
 
     <!-- World link -->
     <link name="world"/>

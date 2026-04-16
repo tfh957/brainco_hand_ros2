@@ -3,7 +3,7 @@ hardware:
   slave_id: 126
   log_level: info
   ensure_physical_mode: true
-  ctrl_param_duration_ms: 10
+  ctrl_param_duration_ms: 55
   position_command_scale: 572.9577951308232
   position_state_scale: 0.0017453292519943296
   velocity_state_scale: 0.0017453292519943296
