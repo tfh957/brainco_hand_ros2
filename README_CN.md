@@ -300,6 +300,29 @@ ros2 launch rm65_with_revo2_right_moveit_config rm65_with_revo2_right_moveit.lau
 - [revo2_with_rm65_demo/gazebo_rm_65_6f_with_revo2_demo/README_CN.md](revo2_with_rm65_demo/gazebo_rm_65_6f_with_revo2_demo/README_CN.md)
 - [revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md](revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md)
 
+### 场景 4.1：RM65 末端 485 真机模式（推荐）
+
+当 Revo2 灵巧手通过 RM65 末端 485 与电源线连接时，不会出现 `/dev/ttyUSB*`。此时建议使用 `rm_revo2_bridge`，通过 RM65 控制器网口将手部轨迹透传到末端 485。
+
+```bash
+# 1) 编译（首次或代码变更后）
+colcon build --packages-select rm_revo2_bridge rm65_with_revo2_right_moveit_config --symlink-install
+source install/setup.bash
+
+# 2) 启动 RM65 + Revo2 MoveIt（真机模式）
+# use_fake_hardware:=false 表示不启动 Fake ros2_control
+# use_rm_revo2_bridge:=true 表示自动启动末端 485 桥接
+ros2 launch rm65_with_revo2_right_moveit_config rm65_with_revo2_right_moveit.launch.py 
+```
+握拳：
+ros2 topic pub --once /revo2_hand_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{joint_names: ['right_thumb_metacarpal_joint','right_thumb_proximal_joint','right_index_proximal_joint','right_middle_proximal_joint','right_ring_proximal_joint','right_pinky_proximal_joint'], points: [{positions: [1.0,1.2,1.2,1.2,1.2,1.2], time_from_start: {sec: 1}}]}"
+
+说明：
+- `use_rm_revo2_bridge:=true` 时，`/revo2_hand_controller/joint_trajectory` 会自动下发到 RM65 末端 485。
+- 如果仅做仿真，请使用 `use_fake_hardware:=true`，并将 `use_rm_revo2_bridge` 设为 `false`。
+- 桥接节点默认发布命令镜像状态：`/revo2_bridge/command_joint_states`。
+- 如需尝试读取末端 485 回读状态，可在独立启动桥接时加参数：`feedback_enabled:=true`，回读 topic 为 `/revo2_bridge/feedback_joint_states`。
+
 ## 双手 MoveIt 仿真示意
 
 ![示意](doc/dual_hand_gazebo_moveit.gif)
