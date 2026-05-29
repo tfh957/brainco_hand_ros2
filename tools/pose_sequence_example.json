@@ -1,0 +1,39 @@
+{
+  "steps": [
+    {
+      "name": "arm_pregrasp",
+      "x": -0.2,
+      "y": 0.0,
+      "z": 0.70,
+      "rpy": [0.0, 0.0, 0.0],
+      "sec": 5.0
+    },
+    {
+      "name": "hand_open",
+      "hand_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "hand_sec": 1.0
+    },
+    {
+      "name": "move_left_and_fist",
+      "x": -0.2,
+      "y": 0.08,
+      "z": 0.55,
+      "rpy": [0.0, 0.0, 0.0],
+      "sec": 4.0,
+      "hand_positions": [1.0, 1.2, 1.2, 1.2, 1.2, 1.2],
+      "hand_sec": 2.0,
+      "order": "arm_then_hand"
+    },
+    {
+      "name": "back_center_and_open",
+      "x": -0.2,
+      "y": 0.0,
+      "z": 0.70,
+      "rpy": [0.0, 0.0, 0.0],
+      "sec": 4.0,
+      "hand_positions": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "hand_sec": 2.0,
+      "order": "parallel"
+    }
+  ]
+}

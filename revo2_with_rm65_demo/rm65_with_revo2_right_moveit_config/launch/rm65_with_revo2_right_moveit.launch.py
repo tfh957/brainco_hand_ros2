@@ -27,13 +27,45 @@ import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 from moveit_configs_utils import MoveItConfigsBuilder
 from moveit_configs_utils.launch_utils import DeclareBooleanLaunchArg
 from srdfdom.srdf import SRDF
+
+
+def _build_moveit_env():
+    blocked_prefixes = {
+        "/home/fishros/rmrobot/rm_ws/install/rm_driver",
+    }
+    env = {"DISPLAY": os.environ.get("DISPLAY", "")}
+    for key in ("AMENT_PREFIX_PATH", "CMAKE_PREFIX_PATH"):
+        raw = os.environ.get(key, "")
+        if not raw:
+            continue
+        kept = [p for p in raw.split(os.pathsep) if p and p not in blocked_prefixes]
+        env[key] = os.pathsep.join(kept)
+    return env
+
+
+def _build_bridge_env():
+    env = {"DISPLAY": os.environ.get("DISPLAY", "")}
+    rm_iface_prefix = "/home/fishros/rmrobot/rm_ws/install/rm_ros_interfaces"
+    py_path = f"{rm_iface_prefix}/local/lib/python3.10/dist-packages"
+    lib_path = f"{rm_iface_prefix}/lib"
+
+    existing_py = os.environ.get("PYTHONPATH", "")
+    existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    existing_ament = os.environ.get("AMENT_PREFIX_PATH", "")
+    existing_cmake = os.environ.get("CMAKE_PREFIX_PATH", "")
+
+    env["PYTHONPATH"] = py_path + (os.pathsep + existing_py if existing_py else "")
+    env["LD_LIBRARY_PATH"] = lib_path + (os.pathsep + existing_ld if existing_ld else "")
+    env["AMENT_PREFIX_PATH"] = rm_iface_prefix + (os.pathsep + existing_ament if existing_ament else "")
+    env["CMAKE_PREFIX_PATH"] = rm_iface_prefix + (os.pathsep + existing_cmake if existing_cmake else "")
+    return env
 
 
 def generate_launch_description():
@@ -47,6 +79,9 @@ def generate_launch_description():
 
     # 主控制参数
     ld.add_action(DeclareBooleanLaunchArg("use_rviz", default_value=True))
+    ld.add_action(DeclareBooleanLaunchArg("use_fake_hardware", default_value=False))
+    ld.add_action(DeclareBooleanLaunchArg("use_rm_revo2_bridge", default_value=True))
+    ld.add_action(DeclareLaunchArgument("rm_robot_ip", default_value="192.168.1.18"))
 
     # Robot State Publisher 参数
     ld.add_action(DeclareLaunchArgument("publish_frequency", default_value="15.0"))
@@ -148,7 +183,7 @@ def generate_launch_description():
         executable="move_group",
         output="screen",
         parameters=move_group_params,
-        additional_env={"DISPLAY": os.environ.get("DISPLAY", "")},
+        additional_env=_build_moveit_env(),
     )
     ld.add_action(move_group_node)
 
@@ -172,6 +207,35 @@ def generate_launch_description():
     )
     ld.add_action(rviz_node)
 
+    # ===== RM65 末端 485 -> Revo2 桥接节点（真机） =====
+    # 仅在 use_fake_hardware=false 且 use_rm_revo2_bridge=true 时启动
+    ld.add_action(
+        Node(
+            package="rm_revo2_bridge",
+            executable="rm_revo2_bridge_node",
+            output="screen",
+            parameters=[
+                {
+                    "rm_robot_ip": LaunchConfiguration("rm_robot_ip"),
+                    "trajectory_topic": "/revo2_hand_controller/joint_trajectory",
+                }
+            ],
+            respawn=True,
+            additional_env=_build_bridge_env(),
+            condition=IfCondition(
+                PythonExpression(
+                    [
+                        "('",
+                        LaunchConfiguration("use_fake_hardware"),
+                        "'.lower() == 'false') and ('",
+                        LaunchConfiguration("use_rm_revo2_bridge"),
+                        "'.lower() == 'true')",
+                    ]
+                )
+            ),
+        )
+    )
+
     # ===== ros2_control 控制器管理器 =====
     # 负责加载和管理各种控制器
     ld.add_action(
@@ -182,6 +246,7 @@ def generate_launch_description():
                 moveit_config.robot_description,
                 str(moveit_config.package_path / "config/ros2_controllers.yaml"),
             ],
+            condition=IfCondition(LaunchConfiguration("use_fake_hardware")),
         )
     )
 
@@ -198,6 +263,7 @@ def generate_launch_description():
                 executable="spawner",
                 arguments=[controller],
                 output="screen",
+                condition=IfCondition(LaunchConfiguration("use_fake_hardware")),
             )
         )
 
