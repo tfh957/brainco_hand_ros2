@@ -53,11 +53,11 @@ class RmRevo2BridgeNode(Node):
         self.last_command_rad = [0.0] * 6
 
         self.hand_backend = str(self.get_parameter("hand_backend").value).strip().lower()
-        if self.hand_backend not in ("rm_driver", "sdk"):
+        if self.hand_backend not in ("auto", "rm_driver", "sdk"):
             self.get_logger().warn(
-                f"Unknown hand_backend={self.hand_backend!r}, fallback to rm_driver"
+                f"Unknown hand_backend={self.hand_backend!r}, fallback to sdk"
             )
-            self.hand_backend = "rm_driver"
+            self.hand_backend = "sdk"
 
         self.feedback_enabled = self._as_bool(self.get_parameter("feedback_enabled").value)
         self.arm = None
@@ -68,7 +68,7 @@ class RmRevo2BridgeNode(Node):
         self.rm_driver_tool_voltage_pub = None
         self.rm_driver_tool_rs485_pub = None
         self.rm_driver_write_result_sub = None
-        if self.hand_backend == "rm_driver":
+        if self.hand_backend in ("auto", "rm_driver"):
             self._init_rm_driver_hand_backend()
 
         self.state_pub_command = self.create_publisher(
@@ -148,15 +148,17 @@ class RmRevo2BridgeNode(Node):
         self.declare_parameter("robotic_arm_package_path", "/home/fishros/rmrobot/2ndHandDemo/2ndHandDemo")
         self.declare_parameter("set_tool_voltage", True)
         self.declare_parameter("tool_voltage_type", 3)
-        self.declare_parameter("hand_backend", "rm_driver")
+        self.declare_parameter("hand_backend", "sdk")
         self.declare_parameter("rm_driver_set_tool_voltage_topic", "/rm_driver/set_tool_voltage_cmd")
         self.declare_parameter("rm_driver_set_tool_rs485_topic", "/rm_driver/set_tool_rs485_mode_cmd")
         self.declare_parameter("rm_driver_write_registers_topic", "/rm_driver/write_modbus_rtu_registers_cmd")
         self.declare_parameter("rm_driver_write_registers_result_topic", "/rm_driver/write_modbus_rtu_registers_result")
         self.declare_parameter("rm_driver_modbus_type", 1)
         self.declare_parameter("rm_driver_init_wait_sec", 2.0)
-        self.declare_parameter("rm_driver_write_result_timeout_sec", 5.0)
+        self.declare_parameter("rm_driver_write_result_timeout_sec", 12.0)
         self.declare_parameter("rm_driver_init_write_mode", True)
+        self.declare_parameter("rm_driver_hand_register_pack", "packed_words")
+        self.declare_parameter("rm_driver_byte_pair_order", "high_low")
 
         self.declare_parameter("state_topic_command", "/revo2_bridge/command_joint_states")
         self.declare_parameter("state_topic_feedback", "/revo2_bridge/feedback_joint_states")
@@ -172,7 +174,7 @@ class RmRevo2BridgeNode(Node):
         self.declare_parameter("hand_write_retry_count", 1)
         self.declare_parameter("hand_reinit_on_write_fail", True)
 
-        self.declare_parameter("arm_interp_enabled", True)
+        self.declare_parameter("arm_interp_enabled", False)
         self.declare_parameter("arm_cmd_rate_hz", 100.0)
         self.declare_parameter("arm_max_step_rad", 0.02)
         self.declare_parameter("arm_min_segment_dt", 0.02)
@@ -312,8 +314,13 @@ class RmRevo2BridgeNode(Node):
 
         return arm
 
+    def _ensure_sdk_arm(self) -> None:
+        if self.arm is None:
+            self.get_logger().warn("Initializing SDK hand backend fallback")
+            self.arm = self._init_rm_arm()
+
     def _reinit_modbus(self) -> None:
-        if self.hand_backend == "rm_driver":
+        if self.hand_backend in ("auto", "rm_driver"):
             rs485_msg = RS485params()
             rs485_msg.mode = 0
             rs485_msg.baudrate = int(self.get_parameter("baudrate").value)
@@ -353,6 +360,7 @@ class RmRevo2BridgeNode(Node):
         address: int,
         data: List[int],
         wait_result: bool = True,
+        num: Optional[int] = None,
     ) -> int:
         if self.rm_driver_write_pub is None:
             return -20
@@ -361,7 +369,7 @@ class RmRevo2BridgeNode(Node):
         msg.address = int(address)
         msg.device = int(self.get_parameter("device_id").value)
         msg.type = int(self.get_parameter("rm_driver_modbus_type").value)
-        msg.num = len(data)
+        msg.num = len(data) if num is None else int(num)
         msg.data = [int(v) for v in data]
 
         self._rm_driver_write_result = None
@@ -376,26 +384,28 @@ class RmRevo2BridgeNode(Node):
             return -21
         return 0 if self._rm_driver_write_result else -22
 
-    def _write_hand_registers(self, adjusted: List[int]) -> int:
-        if self.hand_backend == "rm_driver":
-            position_reg = int(self.get_parameter("position_register").value)
-            retries = int(self.get_parameter("hand_write_retry_count").value)
-            if retries < 0:
-                retries = 0
-            do_reinit = self._as_bool(self.get_parameter("hand_reinit_on_write_fail").value)
+    def _pack_hand_register_data_for_rm_driver(self, adjusted: List[int]) -> tuple[List[int], int]:
+        mode = str(self.get_parameter("rm_driver_hand_register_pack").value).strip().lower()
+        if mode in ("raw", "raw_bytes", "bytes"):
+            return [int(v) for v in adjusted], 3
 
-            ret = -1
-            for attempt in range(retries + 1):
-                ret = self._write_rm_driver_registers(position_reg, adjusted, wait_result=True)
-                if ret == 0:
-                    return 0
-                self.get_logger().warn(
-                    f"rm_driver Write_Modbus_RTU_Registers failed ret={ret}, attempt={attempt + 1}/{retries + 1}"
-                )
-                if do_reinit and attempt < retries:
-                    self._reinit_modbus()
-                    time.sleep(0.05)
-            return ret
+        if len(adjusted) != 6:
+            return [int(v) for v in adjusted], len(adjusted)
+
+        order = str(self.get_parameter("rm_driver_byte_pair_order").value).strip().lower()
+        words: List[int] = []
+        for i in range(0, 6, 2):
+            first = max(0, min(255, int(adjusted[i])))
+            second = max(0, min(255, int(adjusted[i + 1])))
+            if order in ("low_high", "little", "little_endian"):
+                word = (second << 8) | first
+            else:
+                word = (first << 8) | second
+            words.append(word)
+        return words, len(words)
+
+    def _write_hand_registers_sdk(self, adjusted: List[int]) -> int:
+        self._ensure_sdk_arm()
 
         tool_port = int(self.get_parameter("tool_port").value)
         position_reg = int(self.get_parameter("position_register").value)
@@ -422,18 +432,54 @@ class RmRevo2BridgeNode(Node):
                 return 0
 
             self.get_logger().warn(
-                f"Write_Registers failed ret={last_ret}, attempt={attempt + 1}/{retries + 1}"
+                f"SDK Write_Registers failed ret={last_ret}, attempt={attempt + 1}/{retries + 1}"
             )
             if do_reinit and attempt < retries:
                 try:
                     with self._sdk_lock:
+                        # Force SDK-style reinitialization even when hand_backend is auto.
+                        original_backend = self.hand_backend
+                        self.hand_backend = "sdk"
                         self._reinit_modbus()
+                        self.hand_backend = original_backend
                 except Exception as exc:
-                    self.get_logger().warn(f"Modbus reinit exception: {exc}")
+                    self.get_logger().warn(f"SDK Modbus reinit exception: {exc}")
+                    self.hand_backend = original_backend
             if attempt < retries:
                 time.sleep(0.05)
 
         return last_code
+
+    def _write_hand_registers(self, adjusted: List[int]) -> int:
+        if self.hand_backend in ("auto", "rm_driver"):
+            position_reg = int(self.get_parameter("position_register").value)
+            retries = int(self.get_parameter("hand_write_retry_count").value)
+            if retries < 0:
+                retries = 0
+            do_reinit = self._as_bool(self.get_parameter("hand_reinit_on_write_fail").value)
+
+            ret = -1
+            for attempt in range(retries + 1):
+                data, num = self._pack_hand_register_data_for_rm_driver(adjusted)
+                ret = self._write_rm_driver_registers(position_reg, data, wait_result=True, num=num)
+                if ret == 0:
+                    return 0
+                self.get_logger().warn(
+                    f"rm_driver Write_Modbus_RTU_Registers failed ret={ret}, "
+                    f"attempt={attempt + 1}/{retries + 1}, num={num}, data={data}"
+                )
+                if do_reinit and attempt < retries:
+                    self._reinit_modbus()
+                    time.sleep(0.05)
+            if self.hand_backend == "rm_driver":
+                return ret
+
+            self.get_logger().warn(
+                f"rm_driver hand backend failed ret={ret}; falling back to SDK backend"
+            )
+            return self._write_hand_registers_sdk(adjusted)
+
+        return self._write_hand_registers_sdk(adjusted)
 
     def _rad_to_percent(self, rad: float) -> int:
         max_joint_rad = float(self.get_parameter("max_joint_rad").value)

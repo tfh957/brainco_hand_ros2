@@ -55,16 +55,23 @@ class MoveArmPoseSequence(Node):
         self.hand_topic_pub = self.create_publisher(JointTrajectory, HAND_TOPIC, 10)
 
         self.last_arm_joint_state: Optional[JointState] = None
+        self.last_commanded_arm_joint_state: Optional[JointState] = None
         self.create_subscription(JointState, "/joint_states", self._on_joint_state, 20)
 
-    def _on_joint_state(self, msg: JointState):
+    @staticmethod
+    def _arm_only_joint_state(msg: JointState) -> Optional[JointState]:
         name_to_idx = {n: i for i, n in enumerate(msg.name)}
         if any(n not in name_to_idx for n in ARM_JOINTS):
-            return
+            return None
         js = JointState()
         js.name = list(ARM_JOINTS)
         js.position = [float(msg.position[name_to_idx[n]]) for n in ARM_JOINTS]
-        self.last_arm_joint_state = js
+        return js
+
+    def _on_joint_state(self, msg: JointState):
+        js = self._arm_only_joint_state(msg)
+        if js is not None:
+            self.last_arm_joint_state = js
 
     def _wait_for_arm_joint_state(self, timeout_sec: float = 2.0) -> None:
         deadline = time.monotonic() + timeout_sec
@@ -81,6 +88,11 @@ class MoveArmPoseSequence(Node):
         reference = self._joint_positions(reference_state, ARM_JOINTS)
         return max(abs(target[i] - reference[i]) for i in range(len(ARM_JOINTS)))
 
+    def _ik_seed_joint_state(self) -> Optional[JointState]:
+        # Prefer the last solution this script commanded. Live /joint_states can lag or
+        # briefly contain only hand joints while hand-only steps are running.
+        return self.last_commanded_arm_joint_state or self.last_arm_joint_state
+
     def _solve_ik(
         self,
         group_name: str,
@@ -90,48 +102,62 @@ class MoveArmPoseSequence(Node):
         quat: Tuple[float, float, float, float],
         ik_timeout_sec: float,
         ik_attempts: int,
+        retry_without_collisions: bool,
     ) -> JointState:
         if not self.ik_client.wait_for_service(timeout_sec=3.0):
             raise RuntimeError("/compute_ik service not available")
 
+        seed_state = self._ik_seed_joint_state()
         last_code = None
         best_solution = None
         best_delta = float("inf")
-        for _ in range(max(1, ik_attempts)):
-            req = GetPositionIK.Request()
-            req.ik_request = PositionIKRequest()
-            req.ik_request.group_name = group_name
-            req.ik_request.ik_link_name = ik_link_name
-            req.ik_request.pose_stamped.header.frame_id = frame_id
-            req.ik_request.pose_stamped.pose.position.x = float(xyz[0])
-            req.ik_request.pose_stamped.pose.position.y = float(xyz[1])
-            req.ik_request.pose_stamped.pose.position.z = float(xyz[2])
-            req.ik_request.pose_stamped.pose.orientation.x = float(quat[0])
-            req.ik_request.pose_stamped.pose.orientation.y = float(quat[1])
-            req.ik_request.pose_stamped.pose.orientation.z = float(quat[2])
-            req.ik_request.pose_stamped.pose.orientation.w = float(quat[3])
-            req.ik_request.timeout.sec = int(ik_timeout_sec)
-            req.ik_request.timeout.nanosec = int((ik_timeout_sec - int(ik_timeout_sec)) * 1e9)
-            req.ik_request.avoid_collisions = True
-            if self.last_arm_joint_state is not None:
-                req.ik_request.robot_state.joint_state = self.last_arm_joint_state
+        collision_modes = [True]
+        if retry_without_collisions:
+            collision_modes.append(False)
 
-            fut = self.ik_client.call_async(req)
-            rclpy.spin_until_future_complete(self, fut, timeout_sec=ik_timeout_sec + 1.0)
-            if not fut.done() or fut.result() is None:
-                continue
-            resp = fut.result()
-            if resp.error_code.val == MoveItErrorCodes.SUCCESS:
-                if self.last_arm_joint_state is None:
-                    return resp.solution.joint_state
-                delta = self._max_joint_delta(resp.solution.joint_state, self.last_arm_joint_state)
-                if delta < best_delta:
-                    best_delta = delta
-                    best_solution = resp.solution.joint_state
-            last_code = resp.error_code.val
+        for avoid_collisions in collision_modes:
+            if not avoid_collisions:
+                self.get_logger().warn(
+                    "Collision-aware IK failed; retrying IK without collision checking. "
+                    "Joint jump limit is still enforced before execution."
+                )
 
-        if best_solution is not None:
-            return best_solution
+            for _ in range(max(1, ik_attempts)):
+                req = GetPositionIK.Request()
+                req.ik_request = PositionIKRequest()
+                req.ik_request.group_name = group_name
+                req.ik_request.ik_link_name = ik_link_name
+                req.ik_request.pose_stamped.header.frame_id = frame_id
+                req.ik_request.pose_stamped.pose.position.x = float(xyz[0])
+                req.ik_request.pose_stamped.pose.position.y = float(xyz[1])
+                req.ik_request.pose_stamped.pose.position.z = float(xyz[2])
+                req.ik_request.pose_stamped.pose.orientation.x = float(quat[0])
+                req.ik_request.pose_stamped.pose.orientation.y = float(quat[1])
+                req.ik_request.pose_stamped.pose.orientation.z = float(quat[2])
+                req.ik_request.pose_stamped.pose.orientation.w = float(quat[3])
+                req.ik_request.timeout.sec = int(ik_timeout_sec)
+                req.ik_request.timeout.nanosec = int((ik_timeout_sec - int(ik_timeout_sec)) * 1e9)
+                req.ik_request.avoid_collisions = avoid_collisions
+                if seed_state is not None:
+                    req.ik_request.robot_state.joint_state = seed_state
+
+                fut = self.ik_client.call_async(req)
+                rclpy.spin_until_future_complete(self, fut, timeout_sec=ik_timeout_sec + 1.0)
+                if not fut.done() or fut.result() is None:
+                    continue
+                resp = fut.result()
+                if resp.error_code.val == MoveItErrorCodes.SUCCESS:
+                    if seed_state is None:
+                        return resp.solution.joint_state
+                    delta = self._max_joint_delta(resp.solution.joint_state, seed_state)
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_solution = resp.solution.joint_state
+                last_code = resp.error_code.val
+
+            if best_solution is not None:
+                return best_solution
+
         if last_code is None:
             raise RuntimeError("IK timeout")
         raise RuntimeError(f"IK failed, MoveItErrorCode={last_code}")
@@ -263,6 +289,7 @@ class MoveArmPoseSequence(Node):
         arm_send_goal_timeout_sec: float,
         max_joint_jump: float,
         skip_hand: bool,
+        retry_ik_without_collisions: bool,
     ):
         total = len(steps)
         for i, step in enumerate(steps, start=1):
@@ -296,6 +323,7 @@ class MoveArmPoseSequence(Node):
                     quat=quat,
                     ik_timeout_sec=ik_timeout_sec,
                     ik_attempts=ik_attempts,
+                    retry_without_collisions=retry_ik_without_collisions,
                 )
                 if self.last_arm_joint_state is not None:
                     joint_delta = self._max_joint_delta(js, self.last_arm_joint_state)
@@ -338,6 +366,7 @@ class MoveArmPoseSequence(Node):
                             5.0,
                         )
                         self._wait_goal_result(arm_handle, f"{name} arm", arm_sec, 10.0)
+                        self.last_commanded_arm_joint_state = self._arm_only_joint_state(js)
                         self._wait_goal_result(
                             hand_handle,
                             f"{name} hand",
@@ -352,6 +381,7 @@ class MoveArmPoseSequence(Node):
                             arm_sec,
                             send_goal_timeout_sec=arm_send_goal_timeout_sec,
                         )
+                        self.last_commanded_arm_joint_state = self._arm_only_joint_state(js)
                         self._execute_hand_step(
                             step_name=f"[{i}/{total}] {name}",
                             hand_positions=hand_positions,
@@ -380,6 +410,7 @@ class MoveArmPoseSequence(Node):
                         arm_sec,
                         send_goal_timeout_sec=arm_send_goal_timeout_sec,
                     )
+                    self.last_commanded_arm_joint_state = self._arm_only_joint_state(js)
                 else:
                     # auto / arm_then_hand
                     self._send_and_wait(
@@ -389,6 +420,7 @@ class MoveArmPoseSequence(Node):
                         arm_sec,
                         send_goal_timeout_sec=arm_send_goal_timeout_sec,
                     )
+                    self.last_commanded_arm_joint_state = self._arm_only_joint_state(js)
                     if gap_sec > 0.0:
                         time.sleep(gap_sec)
                     self._execute_hand_step(
@@ -408,6 +440,7 @@ class MoveArmPoseSequence(Node):
                     arm_sec,
                     send_goal_timeout_sec=arm_send_goal_timeout_sec,
                 )
+                self.last_commanded_arm_joint_state = self._arm_only_joint_state(js)
             elif has_hand:
                 self.get_logger().info(f"[{i}/{total}] {name}")
                 self._execute_hand_step(
@@ -466,6 +499,11 @@ def build_parser():
         "--skip-hand",
         action="store_true",
         help="ignore hand_positions in the sequence; useful when isolating arm IK/motion from 485 issues",
+    )
+    p.add_argument(
+        "--no-ik-collision-fallback",
+        action="store_true",
+        help="do not retry IK without collision checking after collision-aware IK fails",
     )
     return p
 
@@ -527,6 +565,7 @@ def main():
             arm_send_goal_timeout_sec=args.arm_send_goal_timeout,
             max_joint_jump=args.max_joint_jump,
             skip_hand=args.skip_hand,
+            retry_ik_without_collisions=not args.no_ik_collision_fallback,
         )
         node.get_logger().info("Pose sequence complete")
     except Exception as exc:
