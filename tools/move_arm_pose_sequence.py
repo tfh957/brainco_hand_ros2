@@ -66,6 +66,21 @@ class MoveArmPoseSequence(Node):
         js.position = [float(msg.position[name_to_idx[n]]) for n in ARM_JOINTS]
         self.last_arm_joint_state = js
 
+    def _wait_for_arm_joint_state(self, timeout_sec: float = 2.0) -> None:
+        deadline = time.monotonic() + timeout_sec
+        while self.last_arm_joint_state is None and time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.1)
+
+    @staticmethod
+    def _joint_positions(joint_state: JointState, joint_names: List[str]) -> List[float]:
+        name_to_idx = {n: i for i, n in enumerate(joint_state.name)}
+        return [float(joint_state.position[name_to_idx[n]]) for n in joint_names]
+
+    def _max_joint_delta(self, target_state: JointState, reference_state: JointState) -> float:
+        target = self._joint_positions(target_state, ARM_JOINTS)
+        reference = self._joint_positions(reference_state, ARM_JOINTS)
+        return max(abs(target[i] - reference[i]) for i in range(len(ARM_JOINTS)))
+
     def _solve_ik(
         self,
         group_name: str,
@@ -80,6 +95,8 @@ class MoveArmPoseSequence(Node):
             raise RuntimeError("/compute_ik service not available")
 
         last_code = None
+        best_solution = None
+        best_delta = float("inf")
         for _ in range(max(1, ik_attempts)):
             req = GetPositionIK.Request()
             req.ik_request = PositionIKRequest()
@@ -105,9 +122,16 @@ class MoveArmPoseSequence(Node):
                 continue
             resp = fut.result()
             if resp.error_code.val == MoveItErrorCodes.SUCCESS:
-                return resp.solution.joint_state
+                if self.last_arm_joint_state is None:
+                    return resp.solution.joint_state
+                delta = self._max_joint_delta(resp.solution.joint_state, self.last_arm_joint_state)
+                if delta < best_delta:
+                    best_delta = delta
+                    best_solution = resp.solution.joint_state
             last_code = resp.error_code.val
 
+        if best_solution is not None:
+            return best_solution
         if last_code is None:
             raise RuntimeError("IK timeout")
         raise RuntimeError(f"IK failed, MoveItErrorCode={last_code}")
@@ -170,10 +194,11 @@ class MoveArmPoseSequence(Node):
 
     def _wait_goal_result(self, handle, label: str, sec: float, min_result_timeout_sec: float):
         fut = handle.get_result_async()
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=max(min_result_timeout_sec, sec + 5.0))
+        timeout_sec = max(min_result_timeout_sec, sec + 5.0)
+        rclpy.spin_until_future_complete(self, fut, timeout_sec=timeout_sec)
         if not fut.done() or fut.result() is None:
             handle.cancel_goal_async()
-            raise RuntimeError(f"{label} execution timeout")
+            raise RuntimeError(f"{label} execution timeout ({timeout_sec:.1f}s)")
         result = fut.result().result
         if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
             raise RuntimeError(f"{label} action failed, error_code={result.error_code}")
@@ -236,6 +261,8 @@ class MoveArmPoseSequence(Node):
         hand_mode: str,
         hand_topic_wait: bool,
         arm_send_goal_timeout_sec: float,
+        max_joint_jump: float,
+        skip_hand: bool,
     ):
         total = len(steps)
         for i, step in enumerate(steps, start=1):
@@ -243,12 +270,16 @@ class MoveArmPoseSequence(Node):
 
             has_arm = all(k in step for k in ("x", "y", "z"))
             has_hand = "hand_positions" in step
+            if has_hand and skip_hand:
+                self.get_logger().info(f"[{i}/{total}] {name}: hand skipped (--skip-hand)")
+                has_hand = False
 
             arm_goal = None
             arm_sec = float(step.get("sec", 3.0))
             hand_sec = float(step.get("hand_sec", 1.0))
 
             if has_arm:
+                self._wait_for_arm_joint_state()
                 quat = self._step_quat(step)
                 if quat is None:
                     raise RuntimeError(f"{name}: arm step requires quaternion or rpy")
@@ -266,6 +297,18 @@ class MoveArmPoseSequence(Node):
                     ik_timeout_sec=ik_timeout_sec,
                     ik_attempts=ik_attempts,
                 )
+                if self.last_arm_joint_state is not None:
+                    joint_delta = self._max_joint_delta(js, self.last_arm_joint_state)
+                    self.get_logger().info(
+                        f"{name}: ik_joints={[round(v, 4) for v in self._joint_positions(js, ARM_JOINTS)]}, "
+                        f"max_joint_delta={joint_delta:.3f}rad"
+                    )
+                    if max_joint_jump > 0.0 and joint_delta > max_joint_jump:
+                        raise RuntimeError(
+                            f"{name}: IK solution joint jump too large "
+                            f"({joint_delta:.3f}rad > {max_joint_jump:.3f}rad). "
+                            "Check target pose/rpy or increase --max-joint-jump after confirming safety."
+                        )
                 arm_goal = self._build_arm_goal(js, arm_sec)
 
             if has_hand:
@@ -390,7 +433,12 @@ def build_parser():
     p.add_argument("--ik-timeout", type=float, default=0.5)
     p.add_argument("--ik-attempts", type=int, default=20)
 
-    p.add_argument("--hand-result-timeout-min", type=float, default=10.0)
+    p.add_argument(
+        "--hand-result-timeout-min",
+        type=float,
+        default=40.0,
+        help="minimum wait time for hand action result (s); Modbus retry/reinit can take a while",
+    )
     p.add_argument(
         "--hand-mode",
         choices=["action", "topic"],
@@ -407,6 +455,17 @@ def build_parser():
         type=float,
         default=20.0,
         help="timeout for arm action goal acceptance (s)",
+    )
+    p.add_argument(
+        "--max-joint-jump",
+        type=float,
+        default=4,
+        help="stop before execution if any IK joint differs from current state by more than this radian value; <=0 disables",
+    )
+    p.add_argument(
+        "--skip-hand",
+        action="store_true",
+        help="ignore hand_positions in the sequence; useful when isolating arm IK/motion from 485 issues",
     )
     return p
 
@@ -466,6 +525,8 @@ def main():
             hand_mode=args.hand_mode,
             hand_topic_wait=args.hand_topic_wait,
             arm_send_goal_timeout_sec=args.arm_send_goal_timeout,
+            max_joint_jump=args.max_joint_jump,
+            skip_hand=args.skip_hand,
         )
         node.get_logger().info("Pose sequence complete")
     except Exception as exc:

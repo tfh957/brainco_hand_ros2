@@ -30,6 +30,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("rm_robot_ip", default_value="192.168.1.18"),
             DeclareLaunchArgument("trajectory_topic", default_value="/revo2_hand_controller/joint_trajectory"),
+            DeclareLaunchArgument("hand_backend", default_value="rm_driver"),
             DeclareLaunchArgument("device_id", default_value="127"),
             DeclareLaunchArgument("max_joint_rad", default_value="1.7453292519943295"),
             DeclareLaunchArgument("arm_follow", default_value="false"),
@@ -38,7 +39,7 @@ def generate_launch_description():
             DeclareLaunchArgument("hand_reinit_on_write_fail", default_value="true"),
             DeclareLaunchArgument("feedback_enabled", default_value="false"),
             DeclareLaunchArgument("publish_command_to_joint_states", default_value="true"),
-            DeclareLaunchArgument("publish_hand_state_to_joint_states_rate_hz", default_value="0.0"),
+            DeclareLaunchArgument("publish_hand_state_to_joint_states_rate_hz", default_value="15.0"),
             DeclareLaunchArgument(
                 "robotic_arm_package_path",
                 default_value="/home/fishros/rmrobot/2ndHandDemo/2ndHandDemo",
@@ -52,6 +53,7 @@ def generate_launch_description():
                     {
                         "rm_robot_ip": LaunchConfiguration("rm_robot_ip"),
                         "trajectory_topic": LaunchConfiguration("trajectory_topic"),
+                        "hand_backend": LaunchConfiguration("hand_backend"),
                         "device_id": LaunchConfiguration("device_id"),
                         "max_joint_rad": LaunchConfiguration("max_joint_rad"),
                         "arm_follow": LaunchConfiguration("arm_follow"),

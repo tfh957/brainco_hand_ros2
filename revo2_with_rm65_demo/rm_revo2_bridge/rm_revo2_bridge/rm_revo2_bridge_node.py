@@ -13,10 +13,11 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool, UInt16
 from trajectory_msgs.msg import JointTrajectory
 
 try:
-    from rm_ros_interfaces.msg import Jointpos
+    from rm_ros_interfaces.msg import Jointpos, Modbusrtuwriteparams, RS485params
 except ModuleNotFoundError:
     # fallback: rm_ros_interfaces often exists in rm_ws only
     fallback_paths = [
@@ -25,7 +26,7 @@ except ModuleNotFoundError:
     for p in fallback_paths:
         if os.path.isdir(p) and p not in sys.path:
             sys.path.append(p)
-    from rm_ros_interfaces.msg import Jointpos
+    from rm_ros_interfaces.msg import Jointpos, Modbusrtuwriteparams, RS485params
 
 
 class RmRevo2BridgeNode(Node):
@@ -33,6 +34,8 @@ class RmRevo2BridgeNode(Node):
         super().__init__("rm_revo2_bridge")
         self.action_cb_group = ReentrantCallbackGroup()
         self._sdk_lock = threading.Lock()
+        self._rm_driver_write_event = threading.Event()
+        self._rm_driver_write_result: Optional[bool] = None
 
         self._declare_parameters()
 
@@ -49,7 +52,24 @@ class RmRevo2BridgeNode(Node):
         self.inverse_remap_for_rm = [1, 0, 3, 2, 5, 4]
         self.last_command_rad = [0.0] * 6
 
-        self.arm = self._init_rm_arm()
+        self.hand_backend = str(self.get_parameter("hand_backend").value).strip().lower()
+        if self.hand_backend not in ("rm_driver", "sdk"):
+            self.get_logger().warn(
+                f"Unknown hand_backend={self.hand_backend!r}, fallback to rm_driver"
+            )
+            self.hand_backend = "rm_driver"
+
+        self.feedback_enabled = self._as_bool(self.get_parameter("feedback_enabled").value)
+        self.arm = None
+        if self.hand_backend == "sdk" or self.feedback_enabled:
+            self.arm = self._init_rm_arm()
+
+        self.rm_driver_write_pub = None
+        self.rm_driver_tool_voltage_pub = None
+        self.rm_driver_tool_rs485_pub = None
+        self.rm_driver_write_result_sub = None
+        if self.hand_backend == "rm_driver":
+            self._init_rm_driver_hand_backend()
 
         self.state_pub_command = self.create_publisher(
             JointState, str(self.get_parameter("state_topic_command").value), 10
@@ -74,6 +94,7 @@ class RmRevo2BridgeNode(Node):
                 self.get_logger().info(
                     f"periodic hand joint_states publishing enabled, rate={rate_hz:.2f}Hz"
                 )
+            self._publish_last_hand_command_to_joint_states()
 
         topic = str(self.get_parameter("trajectory_topic").value)
         self.sub = self.create_subscription(JointTrajectory, topic, self.on_trajectory, 10)
@@ -106,7 +127,6 @@ class RmRevo2BridgeNode(Node):
             callback_group=self.action_cb_group,
         )
 
-        self.feedback_enabled = self._as_bool(self.get_parameter("feedback_enabled").value)
         if self.feedback_enabled:
             period = float(self.get_parameter("feedback_timer_period").value)
             self.feedback_timer = self.create_timer(period, self.publish_feedback_state)
@@ -128,12 +148,21 @@ class RmRevo2BridgeNode(Node):
         self.declare_parameter("robotic_arm_package_path", "/home/fishros/rmrobot/2ndHandDemo/2ndHandDemo")
         self.declare_parameter("set_tool_voltage", True)
         self.declare_parameter("tool_voltage_type", 3)
+        self.declare_parameter("hand_backend", "rm_driver")
+        self.declare_parameter("rm_driver_set_tool_voltage_topic", "/rm_driver/set_tool_voltage_cmd")
+        self.declare_parameter("rm_driver_set_tool_rs485_topic", "/rm_driver/set_tool_rs485_mode_cmd")
+        self.declare_parameter("rm_driver_write_registers_topic", "/rm_driver/write_modbus_rtu_registers_cmd")
+        self.declare_parameter("rm_driver_write_registers_result_topic", "/rm_driver/write_modbus_rtu_registers_result")
+        self.declare_parameter("rm_driver_modbus_type", 1)
+        self.declare_parameter("rm_driver_init_wait_sec", 2.0)
+        self.declare_parameter("rm_driver_write_result_timeout_sec", 5.0)
+        self.declare_parameter("rm_driver_init_write_mode", True)
 
         self.declare_parameter("state_topic_command", "/revo2_bridge/command_joint_states")
         self.declare_parameter("state_topic_feedback", "/revo2_bridge/feedback_joint_states")
         self.declare_parameter("publish_command_to_joint_states", True)
         self.declare_parameter("joint_states_topic", "/joint_states")
-        self.declare_parameter("publish_hand_state_to_joint_states_rate_hz", 0.0)
+        self.declare_parameter("publish_hand_state_to_joint_states_rate_hz", 15.0)
 
         self.declare_parameter("feedback_enabled", False)
         self.declare_parameter("feedback_timer_period", 0.1)
@@ -175,6 +204,63 @@ class RmRevo2BridgeNode(Node):
             except Exception:
                 return -999
         return -999
+
+    def _on_rm_driver_write_result(self, msg: Bool) -> None:
+        self._rm_driver_write_result = bool(msg.data)
+        self._rm_driver_write_event.set()
+
+    def _init_rm_driver_hand_backend(self) -> None:
+        write_topic = str(self.get_parameter("rm_driver_write_registers_topic").value)
+        write_result_topic = str(self.get_parameter("rm_driver_write_registers_result_topic").value)
+        voltage_topic = str(self.get_parameter("rm_driver_set_tool_voltage_topic").value)
+        rs485_topic = str(self.get_parameter("rm_driver_set_tool_rs485_topic").value)
+
+        self.rm_driver_write_pub = self.create_publisher(Modbusrtuwriteparams, write_topic, 10)
+        self.rm_driver_write_result_sub = self.create_subscription(
+            Bool, write_result_topic, self._on_rm_driver_write_result, 10
+        )
+        self.rm_driver_tool_voltage_pub = self.create_publisher(UInt16, voltage_topic, 10)
+        self.rm_driver_tool_rs485_pub = self.create_publisher(RS485params, rs485_topic, 10)
+
+        wait_sec = float(self.get_parameter("rm_driver_init_wait_sec").value)
+        deadline = time.monotonic() + max(0.0, wait_sec)
+        while time.monotonic() < deadline:
+            if self.count_subscribers(write_topic) > 0:
+                break
+            time.sleep(0.05)
+
+        if self.count_subscribers(write_topic) == 0:
+            self.get_logger().warn(
+                f"No subscriber on {write_topic}. Is /rm_driver running and sourced?"
+            )
+
+        if self._as_bool(self.get_parameter("set_tool_voltage").value):
+            voltage_msg = UInt16()
+            voltage_msg.data = int(self.get_parameter("tool_voltage_type").value)
+            self.rm_driver_tool_voltage_pub.publish(voltage_msg)
+            self.get_logger().info(
+                f"Published tool voltage via rm_driver: {voltage_topic} data={voltage_msg.data}"
+            )
+
+        rs485_msg = RS485params()
+        rs485_msg.mode = 0
+        rs485_msg.baudrate = int(self.get_parameter("baudrate").value)
+        self.rm_driver_tool_rs485_pub.publish(rs485_msg)
+        self.get_logger().info(
+            f"Published tool RS485 mode via rm_driver: {rs485_topic} mode=0 baudrate={rs485_msg.baudrate}"
+        )
+
+        # Let rm_driver process setup messages before writing the Revo2 mode register.
+        time.sleep(0.3)
+        if self._as_bool(self.get_parameter("rm_driver_init_write_mode").value):
+            init_reg = int(self.get_parameter("init_mode_register").value)
+            init_val = int(self.get_parameter("init_mode_value").value)
+            init_ret = self._write_rm_driver_registers(init_reg, [init_val], wait_result=False)
+            self.get_logger().info(
+                f"Write init register via rm_driver: address={init_reg}, data={init_val} -> ret={init_ret}"
+            )
+
+        self.get_logger().info("Hand backend: rm_driver topic bridge")
 
     def _init_rm_arm(self):
         sdk_root = str(self.get_parameter("robotic_arm_package_path").value)
@@ -227,6 +313,20 @@ class RmRevo2BridgeNode(Node):
         return arm
 
     def _reinit_modbus(self) -> None:
+        if self.hand_backend == "rm_driver":
+            rs485_msg = RS485params()
+            rs485_msg.mode = 0
+            rs485_msg.baudrate = int(self.get_parameter("baudrate").value)
+            if self.rm_driver_tool_rs485_pub is not None:
+                self.rm_driver_tool_rs485_pub.publish(rs485_msg)
+            init_reg = int(self.get_parameter("init_mode_register").value)
+            init_val = int(self.get_parameter("init_mode_value").value)
+            init_ret = self._write_rm_driver_registers(init_reg, [init_val], wait_result=True)
+            self.get_logger().warn(
+                f"rm_driver Modbus reinit published: rs485 mode=0 baudrate={rs485_msg.baudrate}, init_ret={init_ret}"
+            )
+            return
+
         tool_port = int(self.get_parameter("tool_port").value)
         baudrate = int(self.get_parameter("baudrate").value)
         timeout = int(self.get_parameter("timeout_100ms").value)
@@ -248,7 +348,55 @@ class RmRevo2BridgeNode(Node):
             f"close={ret_close}, set={ret_set}, init={ret_init}"
         )
 
+    def _write_rm_driver_registers(
+        self,
+        address: int,
+        data: List[int],
+        wait_result: bool = True,
+    ) -> int:
+        if self.rm_driver_write_pub is None:
+            return -20
+
+        msg = Modbusrtuwriteparams()
+        msg.address = int(address)
+        msg.device = int(self.get_parameter("device_id").value)
+        msg.type = int(self.get_parameter("rm_driver_modbus_type").value)
+        msg.num = len(data)
+        msg.data = [int(v) for v in data]
+
+        self._rm_driver_write_result = None
+        self._rm_driver_write_event.clear()
+        self.rm_driver_write_pub.publish(msg)
+
+        if not wait_result:
+            return 0
+
+        timeout = float(self.get_parameter("rm_driver_write_result_timeout_sec").value)
+        if not self._rm_driver_write_event.wait(max(0.1, timeout)):
+            return -21
+        return 0 if self._rm_driver_write_result else -22
+
     def _write_hand_registers(self, adjusted: List[int]) -> int:
+        if self.hand_backend == "rm_driver":
+            position_reg = int(self.get_parameter("position_register").value)
+            retries = int(self.get_parameter("hand_write_retry_count").value)
+            if retries < 0:
+                retries = 0
+            do_reinit = self._as_bool(self.get_parameter("hand_reinit_on_write_fail").value)
+
+            ret = -1
+            for attempt in range(retries + 1):
+                ret = self._write_rm_driver_registers(position_reg, adjusted, wait_result=True)
+                if ret == 0:
+                    return 0
+                self.get_logger().warn(
+                    f"rm_driver Write_Modbus_RTU_Registers failed ret={ret}, attempt={attempt + 1}/{retries + 1}"
+                )
+                if do_reinit and attempt < retries:
+                    self._reinit_modbus()
+                    time.sleep(0.05)
+            return ret
+
         tool_port = int(self.get_parameter("tool_port").value)
         position_reg = int(self.get_parameter("position_register").value)
         device_id = int(self.get_parameter("device_id").value)
@@ -313,6 +461,9 @@ class RmRevo2BridgeNode(Node):
         self._publish_joint_state(self.state_pub_joint_states, self.last_command_rad)
 
     def publish_feedback_state(self) -> None:
+        if self.arm is None:
+            return
+
         tool_port = int(self.get_parameter("tool_port").value)
         device_id = int(self.get_parameter("device_id").value)
         start = int(self.get_parameter("feedback_register_start").value)

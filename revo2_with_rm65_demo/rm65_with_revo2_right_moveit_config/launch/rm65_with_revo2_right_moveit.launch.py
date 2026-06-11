@@ -217,7 +217,9 @@ def generate_launch_description():
             parameters=[
                 {
                     "rm_robot_ip": LaunchConfiguration("rm_robot_ip"),
+                    "hand_backend": "rm_driver",
                     "trajectory_topic": "/revo2_hand_controller/joint_trajectory",
+                    "publish_hand_state_to_joint_states_rate_hz": 15.0,
                 }
             ],
             respawn=True,
