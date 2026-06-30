@@ -1,416 +1,414 @@
-# BrainCo Hand ROS2 项目
+# BrainCo Hand ROS2 使用说明
 
 [English](README.md) | [简体中文](README_CN.md)
 
+本文档用于快速说明 BrainCo Revo2 灵巧手 ROS2 包的使用方式，重点覆盖当前项目中的 **RM65 机械臂 + Revo2 右手真机系统**。
 
-## 项目概述
+## 1. 项目用途
 
-BrainCo Hand ROS2 是一个完整的 ROS 2 软件包集合，为 BrainCo Revo2 灵巧手提供从硬件驱动到仿真、运动规划的全套解决方案。本项目基于 ROS 2 Humble 开发，支持单手和双手配置，提供硬件控制、Gazebo 仿真、MoveIt 运动规划等功能。
+本仓库提供 Revo2 灵巧手在 ROS2 Humble 下的模型、驱动、仿真、MoveIt 配置，以及 RM65 机械臂末端安装 Revo2 的集成演示。
 
-### 主要特性
+主要功能：
 
-- **完整的硬件驱动支持**：支持 Modbus 、CAN FD 和 Ethercat 通信协议
-- **ros2_control 集成**：完整的 ros2_control 硬件接口实现
-- **Gazebo 仿真环境**：基于 Ignition Gazebo 6 的高保真物理仿真
-- **MoveIt 运动规划**：完整的 MoveIt 2 集成，支持高级运动规划
-- **实时控制**：高频控制循环，实现精确的手指操控
-- **双手支持**：支持左手、右手以及双手同时控制
-- **机械臂集成**：提供 RM65 机械臂与 Revo2 灵巧手的集成演示
+- Revo2 灵巧手 URDF 模型与 RViz 可视化
+- Revo2 单手/双手 ros2_control 驱动
+- Gazebo 仿真
+- MoveIt 运动规划
+- RM65 + Revo2 组合机器人模型与控制配置
+- RM65 末端 485 控制 Revo2 的桥接节点 `rm_revo2_bridge`
+- `tools/` 下的单点位姿、连续动作、手势快捷命令和 TCP 示例脚本
 
-## 系统要求
+## 2. 当前真机系统的控制逻辑
 
-### 基础环境
+当前硬件连接方式：
 
-- **操作系统**：Ubuntu 22.04
-- **ROS 版本**：ROS 2 Humble
-- **Python 版本**：Python 3.8+
-
-### 硬件要求（硬件控制模式）
-
-#### Modbus 模式（默认）
-- Modbus 串口设备（如 `/dev/ttyUSB0`）
-- 串口权限配置（用户需在 `dialout` 组中）
-
-#### CAN FD 模式（可选）
-- ZLG USB-CAN FD 设备（如 USBCANFD-200U）
-- CAN FD 总线连接
-
-#### EtherCAT 模式（可选）
-- EtherCAT 主站（IgH EtherCAT Master）
-- EtherCAT 主站服务配置（`ethercat` 系统服务）
-
-### 仿真环境要求
-
-- **Gazebo**：Ignition Gazebo 6（用于仿真功能包）
-- **MoveIt 2**：用于运动规划功能包
-
-## 项目结构
-
-本项目包含以下主要功能包：
-
+```text
+电脑 --网线--> RM65 控制器 --末端 485/电源线--> Revo2 灵巧手
 ```
+
+这意味着 Revo2 手不是直接插到电脑的 `/dev/ttyUSB*`，而是挂在 RM65 末端 485 上。因此，不能直接用原始 `brainco_hand_driver revo2_system.launch.py` 去扫描电脑串口控制这只手。
+
+当前推荐控制链：
+
+```text
+机械臂状态/控制：
+RM65 真机 <--> rm_ws/rm_driver <--> /joint_states, /rm_driver/movej_canfd_cmd
+
+手部控制：
+/revo2_hand_controller/joint_trajectory
+        -> rm_revo2_bridge
+        -> RM SDK
+        -> RM65 末端 Modbus/485
+        -> Revo2 灵巧手
+
+MoveIt/RViz：
+读取 /joint_states 显示机器人状态，并通过 /rm_group_controller、/revo2_hand_controller 发送轨迹
+```
+
+说明：
+
+- `rm_ws` 负责连接 RM65 真机，发布机械臂关节状态。
+- `brainco_ws` 负责启动 MoveIt、RViz 和 Revo2 末端 485 桥接。
+- `rm_revo2_bridge` 默认使用 `sdk` 后端控制手，稳定性优于通过 `/rm_driver/write_modbus_rtu_registers_cmd` 转发。
+- `/joint_states` 是标准 ROS 关节状态话题，机械臂和手的状态都可以出现在这里，供 `robot_state_publisher` 和 MoveIt 使用。
+
+## 3. 目录结构
+
+```text
 brainco_hand_ros2/
-├── revo2_description/                    # Revo2 灵巧手 URDF 描述包
-├── brainco_hardware/                     # 硬件驱动包
-│   ├── brainco_hand_driver/            # Revo2 灵巧手硬件驱动
-│   └── stark_ethercat/brainco_hand_ethercat_driver/                  # EtherCAT 驱动
-├── brainco_gazebo/                      # Gazebo 仿真包
-├── brainco_moveit_config/               # MoveIt 配置包
-└── revo2_with_rm65_demo/                # RM65 机械臂集成演示
-    ├── gazebo_rm_65_6f_with_revo2_demo/ # RM65+Revo2 Gazebo 仿真
-    └── rm65_with_revo2_right_moveit_config/ # RM65+Revo2 MoveIt 配置
+├── revo2_description/                         # Revo2 URDF/模型
+├── brainco_hardware/brainco_hand_driver/      # 原始 Revo2 硬件驱动
+├── brainco_gazebo/                            # Gazebo 仿真
+├── brainco_moveit_config/                     # Revo2 单独 MoveIt 配置
+├── revo2_with_rm65_demo/
+│   ├── gazebo_rm_65_6f_with_revo2_demo/       # RM65+Revo2 Gazebo 示例
+│   ├── rm65_with_revo2_right_moveit_config/   # RM65+Revo2 MoveIt 配置
+│   └── rm_revo2_bridge/                       # RM65 末端 485 到 Revo2 的桥接节点
+└── tools/                                     # 调试和动作脚本
 ```
 
-## 功能包说明
+## 4. 环境要求
 
-### 1. revo2_description
+- Ubuntu 22.04
+- ROS2 Humble
+- Python 3.10
+- 已编译并可运行的 `rm_ws`
+- 当前项目路径示例：`/home/fishros/rmrobot/brainco_ws`
+- RM65 默认 IP：`192.168.1.18`
 
-**功能**：Revo2 灵巧手的 URDF 模型描述包，提供机器人模型的 3D 可视化。
+如果 RM65 IP 改过，需要同步修改 launch 参数或配置。
 
-**主要特性**：
-- 左右手 URDF 模型
-- RViz 可视化支持
-- 完整的关节和链接定义
+## 5. 获取代码和编译
 
-**详细文档**：请参阅 [revo2_description/README_CN.md](revo2_description/README_CN.md)
-
-### 2. brainco_hardware
-
-**功能**：Revo2 灵巧手的硬件驱动包，提供基于 ros2_control 的硬件接口。
-
-**主要特性**：
-- 支持 Modbus 、CAN FD 和 Ethercat 通信协议
-- 完整的 ros2_control 硬件接口实现
-- 支持单手和双手配置
-- MoveIt 集成支持
-- 实时关节位置和速度反馈
-
-**详细文档**：请参阅 [brainco_hardware/brainco_hand_driver/README_CN.md](brainco_hardware/brainco_hand_driver/README_CN.md)
-
-**Ethercat 详细文档**：请参阅 [brainco_hardware/stark_ethercat/brainco_hand_ethercat_driver/README_CN.md](brainco_hardware/stark_ethercat/brainco_hand_ethercat_driver/README_CN.md)
-
-### 3. brainco_gazebo
-
-**功能**：Revo2 灵巧手的 Gazebo 仿真包，提供完整的物理仿真环境。
-
-**主要特性**：
-- 基于 Ignition Gazebo 6 的物理仿真
-- 支持单手和双手仿真
-- Gazebo-MoveIt 整合
-- RViz 可视化集成
-
-**详细文档**：请参阅 [brainco_gazebo/README_CN.md](brainco_gazebo/README_CN.md)
-
-### 4. brainco_moveit_config
-
-**功能**：Revo2 灵巧手的 MoveIt 配置包，提供运动规划功能。
-
-**主要特性**：
-- 支持左手、右手和双手配置
-- 完整的 MoveIt 2 集成
-- FakeSystem 支持
-
-**详细文档**：请参阅 [brainco_moveit_config/README_CN.md](brainco_moveit_config/README_CN.md)
-
-### 5. revo2_with_rm65_demo
-
-**功能**：RM65 机械臂与 Revo2 灵巧手的集成演示包。
-
-**包含子包**：
-
-#### 5.1 gazebo_rm_65_6f_with_revo2_demo
-
-**功能**：RM65 机械臂与 Revo2 灵巧手的 Gazebo 仿真。
-
-**详细文档**：请参阅 [revo2_with_rm65_demo/gazebo_rm_65_6f_with_revo2_demo/README_CN.md](revo2_with_rm65_demo/gazebo_rm_65_6f_with_revo2_demo/README_CN.md)
-
-#### 5.2 rm65_with_revo2_right_moveit_config
-
-**功能**：RM65 机械臂与 Revo2 灵巧右手的 MoveIt 配置。
-
-**详细文档**：请参阅 [revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md](revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md)
-
-## 快速开始
-
-### 1. 环境准备
+如果是第一次搭建工作空间，可以按下面方式获取代码和依赖仓库：
 
 ```bash
-# 检查 ROS 2 环境
-echo $ROS_DISTRO  # 应该输出: humble
-
-# 创建工作空间（如果还没有）
-mkdir -p <workspace>/src
-cd <workspace>
-```
-
-**注意**：请将 `<workspace>` 替换为您的工作空间路径，例如 `~/brainco_ws`。
-
-### 2. 克隆仓库
-
-```bash
-# 进入工作空间 src 目录
-cd <workspace>/src
-
-# 克隆主仓库
+mkdir -p ~/rmrobot/brainco_ws/src
+cd ~/rmrobot/brainco_ws/src
 git clone https://github.com/BrainCoTech/brainco_hand_ros2.git
 cd brainco_hand_ros2
-
-# 使用 vcs 工具克隆依赖仓库
 vcs import . < brainco_hand.repos --recursive --skip-existing
 ```
 
-**说明**：如果您的系统没有安装 `vcs` 工具，请先安装：
+如果系统没有 `vcs`：
+
 ```bash
 sudo apt-get install python3-vcstool
 ```
 
-### 3. 安装依赖并构建
+在 `brainco_ws` 根目录执行：
 
 ```bash
-# 返回工作空间根目录
-cd <workspace>
-
-# 更新软件包列表
-sudo apt-get update
-
-# 更新 rosdep 数据库
-rosdep update
-
-# 安装所有依赖项
-rosdep install --from-paths src --ignore-src --rosdistro $ROS_DISTRO -y
-
-```
-
-#### 编译
-
-**方式一：使用编译脚本（推荐，简洁方便）**
-
-```bash
-# 默认编译（不启用 CAN FD 和 EtherCAT）
-./build.sh
-
-# 启用 CAN FD 支持
-./build.sh --canfd
-
-# 启用 EtherCAT 支持
-./build.sh --ethercat
-
-# 同时启用 CAN FD 和 EtherCAT
-./build.sh --canfd --ethercat
-
-# Release 模式编译
-./build.sh --release
-
-# Release 模式，启用所有功能
-./build.sh --release --canfd --ethercat
-
-# 查看帮助信息
-./build.sh --help
-```
-
-**方式二：使用 colcon 命令**
-
-```bash
-# 默认编译（不使用 CAN FD 和 EtherCAT）
+cd ~/rmrobot/brainco_ws
+source /opt/ros/humble/setup.bash
 colcon build --symlink-install --packages-ignore stark_ethercat_interface stark_ethercat_driver brainco_hand_ethercat_driver
-
-# 启用 CAN FD 支持
-colcon build --symlink-install --cmake-args -DENABLE_CANFD=ON --packages-ignore stark_ethercat_interface stark_ethercat_driver brainco_hand_ethercat_driver
-
-# 包含 EtherCAT 驱动包
-colcon build --symlink-install
-
-# 只需要 brainco_hand_driver 驱动包（默认Modbus）
-colcon build --packages-up-to brainco_hand_driver --symlink-install
+source install/setup.bash
 ```
 
-**注意事项**：
-- 启用 CAN FD 支持需要 ZLG USB-CAN FD 驱动库，请确保已正确放置到 `brainco_hardware/brainco_hand_driver/vendor/usbcanfd_xxx/` 目录
-- 如果未启用 CAN FD 支持，使用 CAN FD 协议启动节点时会报错
-- 如果禁用了 EtherCAT 支持，使用 EtherCAT 协议启动节点时会报错（找不到相关包）
-- 默认配置（不启用 CAN FD 和 EtherCAT）可以正常使用 Modbus 协议
-- 如果需要使用 CAN FD 或 EtherCAT 协议，请在编译时通过相应参数启用
+如果只改了 `tools/` 下直接用 `python3` 运行的脚本，通常不需要重新 `colcon build`。
 
-## 使用场景
-
-### 场景 1：硬件控制（真实灵巧手）
-
-如果您有真实的 Revo2 灵巧手硬件，可以使用 `brainco_hand_driver` 进行控制：
+如果改了 `rm_revo2_bridge` 或 launch 文件，建议重新编译：
 
 ```bash
-# 启动右手系统（Modbus 模式） 
-ros2 launch brainco_hand_driver revo2_system.launch.py hand_type:=right
-
-# 启动双手系统（Modbus 模式） 
-ros2 launch brainco_hand_driver dual_revo2_system.launch.py
-
-# 启动右手系统（带 MoveIt）
-ros2 launch brainco_moveit_config revo2_real_moveit.launch.py hand_type:=right
-
-# 启动双手系统（带 MoveIt）
-ros2 launch brainco_moveit_config dual_revo2_real_moveit.launch.py
+cd ~/rmrobot/brainco_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --packages-select rm_revo2_bridge rm65_with_revo2_right_moveit_config
+source install/setup.bash
 ```
 
-**详细说明**：请参阅 [brainco_hardware/brainco_hand_driver/README_CN.md](brainco_hardware/brainco_hand_driver/README_CN.md)
+## 6. RM65 + Revo2 真机启动流程
 
-### 场景 2：Gazebo 仿真
-
-如果您想在没有硬件的情况下进行开发和测试，可以使用 Gazebo 仿真：
+### 终端 1：启动 RM65 驱动
 
 ```bash
-# 启动单手仿真
-ros2 launch brainco_gazebo revo2_hand_gazebo.launch.py hand_type:=right
-
-# 启动双手仿真
-ros2 launch brainco_gazebo dual_revo2_hand_gazebo.launch.py
-
-# 启动带 MoveIt 的仿真
-ros2 launch brainco_gazebo revo2_hand_gazebo_moveit.launch.py hand_type:=right
+cd ~/rmrobot/rm_ws
+source install/setup.bash
+./start_rm65.sh
 ```
 
-**详细说明**：请参阅 [brainco_gazebo/README_CN.md](brainco_gazebo/README_CN.md)
+正常情况下可以看到 RM65 连接成功，并持续发布机械臂状态。
 
-### 场景 3：MoveIt 运动规划（无硬件）
-
-如果您想使用 MoveIt 进行运动规划，但不需要硬件或仿真，可以使用 FakeSystem：
+检查机械臂状态：
 
 ```bash
-# 启动右手 MoveIt（FakeSystem）
-ros2 launch brainco_moveit_config revo2_right_moveit.launch.py
-
-# 启动双手 MoveIt（FakeSystem）
-ros2 launch brainco_moveit_config dual_revo2_moveit.launch.py
+ros2 topic echo /joint_states --once
 ```
 
-**详细说明**：请参阅 [brainco_moveit_config/README_CN.md](brainco_moveit_config/README_CN.md)
+应能看到 `joint1` 到 `joint6`。
 
-### 场景 4：机械臂集成演示（FakeSystem）
-
-如果您想测试 RM65 机械臂与 Revo2 灵巧手的集成：
+### 终端 2：启动 MoveIt、RViz 和 Revo2 桥接
 
 ```bash
-# 启动 Gazebo 仿真
-ros2 launch gazebo_rm_65_6f_with_revo2_demo gazebo_rm_65_6f_with_revo2.launch.py
-
-# 启动 MoveIt 配置（FakeSystem）
+cd ~/rmrobot/brainco_ws
+source install/setup.bash
 ros2 launch rm65_with_revo2_right_moveit_config rm65_with_revo2_right_moveit.launch.py
 ```
 
-**详细说明**：
-- [revo2_with_rm65_demo/gazebo_rm_65_6f_with_revo2_demo/README_CN.md](revo2_with_rm65_demo/gazebo_rm_65_6f_with_revo2_demo/README_CN.md)
-- [revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md](revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md)
+当前 launch 默认值：
 
-### 场景 4.1：RM65 末端 485 真机模式（推荐）
+- `use_fake_hardware:=false`
+- `use_rm_revo2_bridge:=true`
+- `rm_robot_ip:=192.168.1.18`
+- `hand_backend:=sdk`
 
-当 Revo2 灵巧手通过 RM65 末端 485 与电源线连接时，不会出现 `/dev/ttyUSB*`。此时建议使用 `rm_revo2_bridge`，通过 RM65 控制器网口将手部轨迹透传到末端 485。
+所以一般不需要再手动追加这些参数。
+
+如果需要指定 IP：
 
 ```bash
-# 1) 编译（首次或代码变更后）
-colcon build --packages-select rm_revo2_bridge rm65_with_revo2_right_moveit_config --symlink-install
-source install/setup.bash
-
-# 2) 启动 RM65 + Revo2 MoveIt（真机模式）
-# use_fake_hardware:=false 表示不启动 Fake ros2_control
-# use_rm_revo2_bridge:=true 表示自动启动末端 485 桥接
-ros2 launch rm65_with_revo2_right_moveit_config rm65_with_revo2_right_moveit.launch.py 
+ros2 launch rm65_with_revo2_right_moveit_config rm65_with_revo2_right_moveit.launch.py rm_robot_ip:=192.168.1.18
 ```
-握拳：
+
+检查桥接节点：
+
+```bash
+ros2 node list | grep rm_revo2_bridge
+ros2 param get /rm_revo2_bridge hand_backend
+```
+
+期望：
+
+```text
+/rm_revo2_bridge
+String value is: sdk
+```
+
+## 7. 常用控制命令
+
+### 7.1 控制 Revo2 张开
+
+```bash
+ros2 topic pub --once /revo2_hand_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{joint_names: ['right_thumb_metacarpal_joint','right_thumb_proximal_joint','right_index_proximal_joint','right_middle_proximal_joint','right_ring_proximal_joint','right_pinky_proximal_joint'], points: [{positions: [0.0,0.0,0.0,0.0,0.0,0.0], time_from_start: {sec: 1}}]}"
+```
+
+### 7.2 控制 Revo2 握拳
+
+```bash
 ros2 topic pub --once /revo2_hand_controller/joint_trajectory trajectory_msgs/msg/JointTrajectory "{joint_names: ['right_thumb_metacarpal_joint','right_thumb_proximal_joint','right_index_proximal_joint','right_middle_proximal_joint','right_ring_proximal_joint','right_pinky_proximal_joint'], points: [{positions: [1.0,1.2,1.2,1.2,1.2,1.2], time_from_start: {sec: 1}}]}"
+```
+
+### 7.3 使用快捷函数
+
+```bash
+cd ~/rmrobot/brainco_ws/src/src/brainco_hand_ros2
+source tools/revo2_cmds.sh
+revo2_open
+revo2_fist
+revo2_pub 0.3 0.8 1.2 1.2 1.2 1.2 1
+```
+
+`revo2_pub` 最后一个参数是动作时间 `sec`，单位秒。
+
+## 8. tools 脚本
+
+进入源码目录：
+
+```bash
+cd ~/rmrobot/brainco_ws/src/src/brainco_hand_ros2
+```
+
+### 8.1 机械臂末端移动到单个位姿
+
+```bash
+python3 tools/move_arm_to_pose.py \
+  --x -0.20 --y 0.00 --z 0.70 \
+  --roll 0 --pitch 0 --yaw 0 \
+  --sec 6.0
+```
 
 说明：
-- `use_rm_revo2_bridge:=true` 时，`/revo2_hand_controller/joint_trajectory` 会自动下发到 RM65 末端 485。
-- 如果仅做仿真，请使用 `use_fake_hardware:=true`，并将 `use_rm_revo2_bridge` 设为 `false`。
-- 桥接节点默认发布命令镜像状态：`/revo2_bridge/command_joint_states`。
-- 如需尝试读取末端 485 回读状态，可在独立启动桥接时加参数：`feedback_enabled:=true`，回读 topic 为 `/revo2_bridge/feedback_joint_states`。
 
-## 双手 MoveIt 仿真示意
+- `x y z` 是目标末端位置，单位米。
+- `roll pitch yaw` 是欧拉角，单位弧度。
+- `sec` 是发送给轨迹控制器的期望运动时间。
 
-![示意](doc/dual_hand_gazebo_moveit.gif)
-
-## 控制接口
-
-### Topic 接口
-
-所有功能包都提供标准的 ROS 2 Topic 接口：
-
-- **关节状态**：`/joint_states` (sensor_msgs/JointState)
-- **轨迹命令**：`/xxx_revo2_hand_controller/joint_trajectory` (trajectory_msgs/JointTrajectory)
-
-### Action 接口
-
-- **轨迹执行**：`/xxx_revo2_hand_controller/follow_joint_trajectory` (control_msgs/action/FollowJointTrajectory)
-
-### 控制示例
-
-#### 右手张开手掌
+### 8.2 连续动作序列：机械臂 + 手
 
 ```bash
-ros2 topic pub --once /right_revo2_hand_controller/joint_trajectory \
-  trajectory_msgs/msg/JointTrajectory \
-  '{
-    joint_names: [
-      "right_thumb_proximal_joint",
-      "right_thumb_metacarpal_joint",
-      "right_index_proximal_joint",
-      "right_middle_proximal_joint",
-      "right_ring_proximal_joint",
-      "right_pinky_proximal_joint"
-    ],
-    points: [{
-      positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-      time_from_start: {sec: 1}
-    }]
-  }'
+python3 tools/move_arm_pose_sequence.py --sequence-file tools/shake_hand.json
 ```
 
-#### 右手握拳
+常用调试参数：
 
 ```bash
-ros2 topic pub --once /right_revo2_hand_controller/joint_trajectory \
-  trajectory_msgs/msg/JointTrajectory \
-  '{
-    joint_names: [
-      "right_thumb_proximal_joint",
-      "right_thumb_metacarpal_joint",
-      "right_index_proximal_joint",
-      "right_middle_proximal_joint",
-      "right_ring_proximal_joint",
-      "right_pinky_proximal_joint"
-    ],
-    points: [{
-      positions: [0.8, 0.1, 1.4, 1.4, 1.4, 1.4],
-      time_from_start: {sec: 2}
-    }]
-  }'
+# 只跑机械臂，不控制手
+python3 tools/move_arm_pose_sequence.py --sequence-file tools/shake_hand.json --skip-hand
+
+# 手部用 topic 模式，并按 hand_sec 等待
+python3 tools/move_arm_pose_sequence.py --sequence-file tools/shake_hand.json --hand-mode topic --hand-topic-wait
+
+# 增加 IK 计算时间
+python3 tools/move_arm_pose_sequence.py --sequence-file tools/shake_hand.json --ik-timeout 1.0 --ik-attempts 50
 ```
 
-## 监控和调试
+关于 IK warning：
 
-### 系统状态检查
+```text
+Collision-aware IK failed; retrying IK without collision checking.
+```
+
+这表示 MoveIt 的碰撞感知 IK 太严格，脚本改用不带碰撞检查的 IK 重试。脚本仍会保留关节跳变检查，避免突然跳到跨度过大的解。
+
+更多工具说明见：[`tools/README.md`](tools/README.md)。
+
+## 9. 原始 Revo2 单独驱动模式
+
+如果 Revo2 直接通过 USB/串口连接电脑，而不是挂在 RM65 末端 485 上，可以使用原始驱动：
 
 ```bash
-# 列出所有运行的节点
+ros2 launch brainco_hand_driver revo2_system.launch.py hand_type:=right
+```
+
+原始右手控制话题通常是：
+
+```text
+/right_revo2_hand_controller/joint_trajectory
+```
+
+当前 RM65 末端 485 桥接模式使用的话题是：
+
+```text
+/revo2_hand_controller/joint_trajectory
+```
+
+二者不要混淆。
+
+## 10. 仿真和纯 MoveIt 模式
+
+### Revo2 单独 Gazebo 仿真
+
+```bash
+ros2 launch brainco_gazebo revo2_hand_gazebo.launch.py hand_type:=right
+```
+
+### Revo2 单独 MoveIt FakeSystem
+
+```bash
+ros2 launch brainco_moveit_config revo2_right_moveit.launch.py
+```
+
+### RM65 + Revo2 Gazebo 仿真
+
+```bash
+ros2 launch gazebo_rm_65_6f_with_revo2_demo gazebo_rm_65_6f_with_revo2.launch.py
+```
+
+## 11. 状态检查和排错
+
+### 11.1 检查节点
+
+```bash
 ros2 node list
-
-# 列出所有控制器
-ros2 control list_controllers
-
-# 检查硬件组件
-ros2 control list_hardware_components
-
-# 检查硬件接口
-ros2 control list_hardware_interfaces
-
-# 列出所有话题
-ros2 topic list
-
-# 列出所有动作
-ros2 action list
-
-# 监控关节状态
-ros2 topic echo /joint_states
 ```
 
-## 联系方式
+关键节点：
 
-如有问题或建议，请联系开发团队。
+```text
+/rm_driver
+/udp_publish_node
+/rm_revo2_bridge
+/move_group
+/robot_state_publisher
+/rviz
+```
+
+### 11.2 检查 action server
+
+```bash
+ros2 action info /rm_group_controller/follow_joint_trajectory
+ros2 action info /revo2_hand_controller/follow_joint_trajectory
+```
+
+应能看到 `/rm_revo2_bridge` 作为 action server。
+
+### 11.3 检查关节状态
+
+```bash
+ros2 topic echo /joint_states --once
+```
+
+机械臂状态应包含：
+
+```text
+joint1 joint2 joint3 joint4 joint5 joint6
+```
+
+手部状态应包含：
+
+```text
+right_thumb_metacarpal_joint
+right_thumb_proximal_joint
+right_index_proximal_joint
+right_middle_proximal_joint
+right_ring_proximal_joint
+right_pinky_proximal_joint
+```
+
+如果 MoveIt 报：
+
+```text
+The complete state of the robot is not yet known. Missing right_...
+```
+
+通常表示 `/joint_states` 暂时没有手部关节状态。确认 `rm_revo2_bridge` 已启动，且手部写入成功。
+
+### 11.4 手不动时重点看桥接日志
+
+成功日志通常包含：
+
+```text
+hand_backend=sdk
+Set_Tool_Voltage(type=3) -> 0
+Set_Modbus_Mode(...) -> 0
+Write_Single_Register(...) -> 0
+Write_Registers -> ret=0
+```
+
+如果看到：
+
+```text
+Write_Registers failed ret=7: SOCKET_TIME_OUT
+```
+
+表示通过 SDK 写末端 485 超时，需要检查 RM65 末端 485 模式、电源、设备 ID、波特率或是否有其他程序占用。
+
+如果看到：
+
+```text
+rm_driver Write_Modbus_RTU_Registers failed ret=-21
+```
+
+这是旧的 `rm_driver` hand backend 等待结果超时。当前默认已经改为 `sdk`，正常不应优先走这个后端。
+
+### 11.5 机械臂动作很快或一卡一卡
+
+可优先检查：
+
+- `shake_hand.json` 或其他序列文件里的 `sec` 是否太小。
+- 目标点之间距离是否太大。
+- 是否频繁触发 IK fallback。
+- RM65 是否处于报警或限位状态。
+- `rm_ws/start_rm65.sh` 是否正常连接。
+
+## 12. 常见启动顺序
+
+完整真机流程建议固定为：
+
+```text
+1. 打开 RM65 和 Revo2 供电
+2. 终端 1：启动 rm_ws/start_rm65.sh
+3. 确认 /joint_states 中有 joint1-joint6
+4. 终端 2：启动 rm65_with_revo2_right_moveit.launch.py
+5. 确认 /rm_revo2_bridge 存在，hand_backend=sdk
+6. 用 revo2_open/revo2_fist 或 tools 脚本测试
+7. 再使用 RViz 或序列动作控制整套系统
+```
+
+## 13. 相关文档
+
+- Revo2 模型：[`revo2_description/README_CN.md`](revo2_description/README_CN.md)
+- Revo2 原始驱动：[`brainco_hardware/brainco_hand_driver/README_CN.md`](brainco_hardware/brainco_hand_driver/README_CN.md)
+- Gazebo：[`brainco_gazebo/README_CN.md`](brainco_gazebo/README_CN.md)
+- MoveIt：[`brainco_moveit_config/README_CN.md`](brainco_moveit_config/README_CN.md)
+- RM65 + Revo2 MoveIt：[`revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md`](revo2_with_rm65_demo/rm65_with_revo2_right_moveit_config/README_CN.md)
+- 工具脚本：[`tools/README.md`](tools/README.md)
